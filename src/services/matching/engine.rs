@@ -13,6 +13,7 @@
 use super::history::HistoryManager;
 use super::orderbook::Orderbook;
 use super::types::*;
+use crate::metrics;
 use crate::models::market::ShareType;
 use dashmap::DashMap;
 use rust_decimal::Decimal;
@@ -355,6 +356,18 @@ impl MatchingEngine {
             return Err(MatchingError::InvalidPrice("Limit order requires price".to_string()));
         }
 
+        // Record order submission metric
+        let timer = metrics::Timer::new();
+        let side_str = match side {
+            Side::Buy => "buy",
+            Side::Sell => "sell",
+        };
+        let order_type_str = match order_type {
+            OrderType::Limit => "limit",
+            OrderType::Market => "market",
+        };
+        metrics::record_order_submitted(side_str, order_type_str);
+
         let now = chrono::Utc::now().timestamp_millis();
 
         debug!(
@@ -451,7 +464,7 @@ impl MatchingEngine {
 
         let filled_amount = amount - remaining;
 
-        // Broadcast trade events
+        // Broadcast trade events and record metrics
         for trade in &trades {
             // Use from_execution to preserve match_type (Normal/Mint/Merge)
             let event = TradeEvent::from_execution(
@@ -461,8 +474,27 @@ impl MatchingEngine {
                 side,
             );
 
-            // Broadcast with detailed logging
+            // Record trade metrics
             let match_type_str = match trade.match_type {
+                MatchType::Normal => "normal",
+                MatchType::Mint => "mint",
+                MatchType::Merge => "merge",
+            };
+            metrics::record_order_matched(match_type_str);
+
+            // Record trade volume (convert Decimal to f64 for metrics)
+            let volume_usdc = (trade.price * trade.amount).to_string().parse::<f64>().unwrap_or(0.0);
+            metrics::record_trade_executed(match_type_str, volume_usdc);
+
+            // Record mint/merge specific metrics
+            match trade.match_type {
+                MatchType::Mint => metrics::record_mint_operation(),
+                MatchType::Merge => metrics::record_merge_operation(),
+                MatchType::Normal => {}
+            }
+
+            // Broadcast with detailed logging
+            let match_type_log = match trade.match_type {
                 MatchType::Normal => "NORMAL",
                 MatchType::Mint => "🔨 MINT",
                 MatchType::Merge => "🔄 MERGE",
@@ -471,13 +503,13 @@ impl MatchingEngine {
                 Ok(n) => {
                     info!(
                         "📊 {} Trade broadcast to {} subscribers: symbol={}, price={}, amount={}, side={}",
-                        match_type_str, n, event.symbol, event.price, event.amount, event.side
+                        match_type_log, n, event.symbol, event.price, event.amount, event.side
                     );
                 }
                 Err(e) => {
                     warn!(
                         "⚠️  Failed to broadcast {} trade (no subscribers?): {} - symbol={}, price={}",
-                        match_type_str, e, event.symbol, event.price
+                        match_type_log, e, event.symbol, event.price
                     );
                 }
             }
@@ -571,6 +603,9 @@ impl MatchingEngine {
         // Broadcast orderbook update after order processing
         self.broadcast_orderbook_update(symbol);
 
+        // Record order matching duration
+        metrics::record_order_match_duration(timer.elapsed_secs());
+
         Ok(MatchResult {
             order_id,
             status,
@@ -590,6 +625,9 @@ impl MatchingEngine {
         let cancelled = orderbook.cancel_order(order_id);
 
         if cancelled.is_some() {
+            // Record cancellation metric
+            metrics::record_order_cancelled();
+
             // Update order history
             self.history.update_order(user_address, &order_id.to_string(), |order| {
                 order.status = "cancelled".to_string();

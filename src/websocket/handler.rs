@@ -7,15 +7,20 @@ use futures::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::auth::eip712::{verify_ws_auth_signature, WebSocketAuthMessage};
 use crate::auth::jwt::validate_token;
+use crate::metrics;
 #[allow(unused_imports)]
 use crate::services::matching::OrderbookUpdate;
 use crate::AppState;
+
+/// Global WebSocket connection counter
+static WS_CONNECTION_COUNT: AtomicI64 = AtomicI64::new(0);
 
 /// Normalize symbol format to backend format (BTCUSDT)
 /// Supports multiple input formats:
@@ -270,6 +275,11 @@ fn validate_timestamp(timestamp: u64) -> bool {
 }
 
 pub async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
+    // Track WebSocket connection
+    let connection_count = WS_CONNECTION_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+    metrics::set_ws_connections(connection_count);
+    tracing::info!("🔌 WebSocket connected (total: {})", connection_count);
+
     let (mut sender, mut receiver) = socket.split();
 
     let mut authenticated = false;
@@ -303,6 +313,7 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             msg = receiver.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
+                        metrics::record_ws_message_received();
                         if let Err(response) = handle_client_message(
                             &text,
                             &mut authenticated,
@@ -312,6 +323,7 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             &mut sender,
                         ).await {
                             let _ = sender.send(Message::Text(serde_json::to_string(&response).unwrap())).await;
+                            metrics::record_ws_message_sent();
                         }
                     }
                     Some(Ok(Message::Ping(data))) => {
@@ -568,7 +580,10 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    tracing::info!("WebSocket connection closed for {:?}", user_address);
+    // Track WebSocket disconnection
+    let connection_count = WS_CONNECTION_COUNT.fetch_sub(1, Ordering::SeqCst) - 1;
+    metrics::set_ws_connections(connection_count);
+    tracing::info!("🔌 WebSocket disconnected (remaining: {}) for {:?}", connection_count, user_address);
 }
 
 async fn handle_client_message(

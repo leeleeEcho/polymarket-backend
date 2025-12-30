@@ -15,6 +15,7 @@ use uuid::Uuid;
 use super::keys::{ttl, CacheKey};
 use super::redis_client::RedisClient;
 use super::CacheError;
+use crate::metrics;
 
 /// Cached market data
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,27 +80,34 @@ impl MarketCache {
 
     /// Get cached market by ID
     pub async fn get_market(&self, market_id: Uuid) -> Result<Option<CachedMarket>, CacheError> {
+        let timer = metrics::Timer::new();
         let key = CacheKey::market(&market_id.to_string());
         let data: Option<String> = self.redis.get(&key).await?;
 
-        match data {
+        let result = match data {
             Some(json) => {
                 let market: CachedMarket = serde_json::from_str(&json)?;
+                metrics::record_cache_hit("market");
                 debug!("Cache hit for market {}", market_id);
                 Ok(Some(market))
             }
             None => {
+                metrics::record_cache_miss("market");
                 debug!("Cache miss for market {}", market_id);
                 Ok(None)
             }
-        }
+        };
+        metrics::record_cache_operation("market", "get", timer.elapsed_secs());
+        result
     }
 
     /// Cache market data
     pub async fn set_market(&self, market: &CachedMarket) -> Result<(), CacheError> {
+        let timer = metrics::Timer::new();
         let key = CacheKey::market(&market.id.to_string());
         let json = serde_json::to_string(market)?;
         self.redis.set_ex(&key, &json, ttl::MARKET).await?;
+        metrics::record_cache_operation("market", "set", timer.elapsed_secs());
         debug!("Cached market {}", market.id);
         Ok(())
     }
@@ -331,6 +339,7 @@ impl MarketCache {
         outcome_id: Uuid,
         share_type: &str,
     ) -> Result<Option<CachedPMOrderbook>, CacheError> {
+        let timer = metrics::Timer::new();
         let key = CacheKey::pm_orderbook_snapshot(
             &market_id.to_string(),
             &outcome_id.to_string(),
@@ -338,9 +347,10 @@ impl MarketCache {
         );
         let data: Option<String> = self.redis.get(&key).await?;
 
-        match data {
+        let result = match data {
             Some(json) => {
                 let orderbook: CachedPMOrderbook = serde_json::from_str(&json)?;
+                metrics::record_cache_hit("orderbook");
                 debug!(
                     "Cache hit for orderbook {}:{}:{}",
                     market_id, outcome_id, share_type
@@ -348,17 +358,21 @@ impl MarketCache {
                 Ok(Some(orderbook))
             }
             None => {
+                metrics::record_cache_miss("orderbook");
                 debug!(
                     "Cache miss for orderbook {}:{}:{}",
                     market_id, outcome_id, share_type
                 );
                 Ok(None)
             }
-        }
+        };
+        metrics::record_cache_operation("orderbook", "get", timer.elapsed_secs());
+        result
     }
 
     /// Cache orderbook snapshot
     pub async fn set_orderbook(&self, orderbook: &CachedPMOrderbook) -> Result<(), CacheError> {
+        let timer = metrics::Timer::new();
         let key = CacheKey::pm_orderbook_snapshot(
             &orderbook.market_id.to_string(),
             &orderbook.outcome_id.to_string(),
@@ -368,6 +382,7 @@ impl MarketCache {
         self.redis
             .set_ex(&key, &json, ttl::MARKET_ORDERBOOK)
             .await?;
+        metrics::record_cache_operation("orderbook", "set", timer.elapsed_secs());
         debug!(
             "Cached orderbook {}:{}:{}",
             orderbook.market_id, orderbook.outcome_id, orderbook.share_type

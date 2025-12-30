@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::{routing::get, Router};
+use axum::{middleware, routing::get, Router};
 use serde::Serialize;
 use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
@@ -155,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/metrics", get(metrics_endpoint))
         .nest("/api/v1", api::routes::create_router(state.clone()))
         .nest("/ws", websocket::routes::create_router(state.clone()))
+        .layer(middleware::from_fn(api::middleware::metrics_middleware))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)

@@ -1,2 +1,10 @@
-// API middleware - rate limiting, logging, etc.
-// Currently using tower-http middleware in main.rs
+//! API Middleware
+//!
+//! Contains middleware for:
+//! - HTTP metrics recording
+//! - Rate limiting (future)
+//! - Request logging
+
+pub mod metrics;
+
+pub use metrics::metrics_middleware;
