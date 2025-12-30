@@ -17,6 +17,12 @@ pub mod prefix {
     pub const KLINE: &str = "kline";
     pub const CHANNEL: &str = "channel";
     pub const POSITION: &str = "position";
+
+    // Prediction market specific prefixes
+    pub const MARKET: &str = "market";
+    pub const OUTCOME: &str = "outcome";
+    pub const SHARE: &str = "share";
+    pub const PROBABILITY: &str = "prob";
 }
 
 /// Cache TTL values in seconds
@@ -40,6 +46,18 @@ pub mod ttl {
     pub const RATE_LIMIT: u64 = 60;
     /// K-line data TTL (60 seconds)
     pub const KLINE: u64 = 60;
+
+    // Prediction market specific TTLs
+    /// Market data TTL (60 seconds)
+    pub const MARKET: u64 = 60;
+    /// Market list TTL (30 seconds)
+    pub const MARKET_LIST: u64 = 30;
+    /// Probability TTL (5 seconds)
+    pub const PROBABILITY: u64 = 5;
+    /// User shares TTL (10 seconds)
+    pub const SHARES: u64 = 10;
+    /// Market orderbook TTL (2 seconds)
+    pub const MARKET_ORDERBOOK: u64 = 2;
 }
 
 /// Cache key builders
@@ -236,6 +254,129 @@ impl CacheKey {
     pub fn pattern_user_all(address: &str) -> String {
         format!("{}:*:{}", prefix::USER, address.to_lowercase())
     }
+
+    // ==================== Prediction Market Keys ====================
+
+    /// Key for market data: market:{market_id}
+    pub fn market(market_id: &str) -> String {
+        format!("{}:{}", prefix::MARKET, market_id)
+    }
+
+    /// Key for market list: market:list:{category}
+    pub fn market_list(category: Option<&str>) -> String {
+        match category {
+            Some(cat) => format!("{}:list:{}", prefix::MARKET, cat),
+            None => format!("{}:list:all", prefix::MARKET),
+        }
+    }
+
+    /// Key for active markets list: market:list:active
+    pub fn market_list_active() -> String {
+        format!("{}:list:active", prefix::MARKET)
+    }
+
+    /// Key for outcome probability: prob:{market_id}:{outcome_id}
+    pub fn probability(market_id: &str, outcome_id: &str) -> String {
+        format!("{}:{}:{}", prefix::PROBABILITY, market_id, outcome_id)
+    }
+
+    /// Key for market probabilities (all outcomes): prob:{market_id}
+    pub fn market_probabilities(market_id: &str) -> String {
+        format!("{}:{}", prefix::PROBABILITY, market_id)
+    }
+
+    /// Key for prediction market orderbook: orderbook:pm:{market_id}:{outcome_id}:{share_type}
+    pub fn pm_orderbook(market_id: &str, outcome_id: &str, share_type: &str) -> String {
+        format!(
+            "{}:pm:{}:{}:{}",
+            prefix::ORDERBOOK, market_id, outcome_id, share_type.to_lowercase()
+        )
+    }
+
+    /// Key for prediction market orderbook snapshot
+    pub fn pm_orderbook_snapshot(market_id: &str, outcome_id: &str, share_type: &str) -> String {
+        format!(
+            "{}:pm:{}:{}:{}:snapshot",
+            prefix::ORDERBOOK, market_id, outcome_id, share_type.to_lowercase()
+        )
+    }
+
+    /// Key for user shares: share:{address}:{market_id}
+    pub fn user_shares(address: &str, market_id: Option<&str>) -> String {
+        match market_id {
+            Some(mid) => format!("{}:{}:{}", prefix::SHARE, address.to_lowercase(), mid),
+            None => format!("{}:{}", prefix::SHARE, address.to_lowercase()),
+        }
+    }
+
+    /// Key for specific share holding: share:{address}:{market_id}:{outcome_id}:{share_type}
+    pub fn share_holding(
+        address: &str,
+        market_id: &str,
+        outcome_id: &str,
+        share_type: &str,
+    ) -> String {
+        format!(
+            "{}:{}:{}:{}:{}",
+            prefix::SHARE,
+            address.to_lowercase(),
+            market_id,
+            outcome_id,
+            share_type.to_lowercase()
+        )
+    }
+
+    /// Key for market trades: market:{market_id}:trades
+    pub fn market_trades(market_id: &str) -> String {
+        format!("{}:{}:trades", prefix::MARKET, market_id)
+    }
+
+    /// Key for market volume: market:{market_id}:volume
+    pub fn market_volume(market_id: &str) -> String {
+        format!("{}:{}:volume", prefix::MARKET, market_id)
+    }
+
+    // ==================== Prediction Market Pub/Sub Channels ====================
+
+    /// Channel for market trades: channel:pm:trades:{market_id}
+    pub fn channel_pm_trades(market_id: &str) -> String {
+        format!("{}:pm:trades:{}", prefix::CHANNEL, market_id)
+    }
+
+    /// Channel for market orderbook: channel:pm:orderbook:{market_id}:{outcome_id}:{share_type}
+    pub fn channel_pm_orderbook(market_id: &str, outcome_id: &str, share_type: &str) -> String {
+        format!(
+            "{}:pm:orderbook:{}:{}:{}",
+            prefix::CHANNEL, market_id, outcome_id, share_type.to_lowercase()
+        )
+    }
+
+    /// Channel for market probability updates: channel:pm:prob:{market_id}
+    pub fn channel_pm_probability(market_id: &str) -> String {
+        format!("{}:pm:prob:{}", prefix::CHANNEL, market_id)
+    }
+
+    /// Channel for user share updates: channel:pm:shares:{address}
+    pub fn channel_pm_user_shares(address: &str) -> String {
+        format!("{}:pm:shares:{}", prefix::CHANNEL, address.to_lowercase())
+    }
+
+    // ==================== Prediction Market Pattern Keys ====================
+
+    /// Pattern for all market keys: market:*
+    pub fn pattern_all_markets() -> String {
+        format!("{}:*", prefix::MARKET)
+    }
+
+    /// Pattern for all probability keys: prob:*
+    pub fn pattern_all_probabilities() -> String {
+        format!("{}:*", prefix::PROBABILITY)
+    }
+
+    /// Pattern for user's all shares: share:{address}:*
+    pub fn pattern_user_shares(address: &str) -> String {
+        format!("{}:{}:*", prefix::SHARE, address.to_lowercase())
+    }
 }
 
 #[cfg(test)]
@@ -272,5 +413,96 @@ mod tests {
         assert_eq!(ttl::PRICE, 5);
         assert_eq!(ttl::SESSION, 86400);
         assert_eq!(ttl::BALANCE, 30);
+    }
+
+    // Prediction market tests
+    #[test]
+    fn test_market_keys() {
+        let market_id = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(
+            CacheKey::market(market_id),
+            "market:550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(CacheKey::market_list(None), "market:list:all");
+        assert_eq!(CacheKey::market_list(Some("sports")), "market:list:sports");
+        assert_eq!(CacheKey::market_list_active(), "market:list:active");
+    }
+
+    #[test]
+    fn test_probability_keys() {
+        let market_id = "550e8400-e29b-41d4-a716-446655440000";
+        let outcome_id = "660e8400-e29b-41d4-a716-446655440001";
+        assert_eq!(
+            CacheKey::probability(market_id, outcome_id),
+            "prob:550e8400-e29b-41d4-a716-446655440000:660e8400-e29b-41d4-a716-446655440001"
+        );
+        assert_eq!(
+            CacheKey::market_probabilities(market_id),
+            "prob:550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[test]
+    fn test_pm_orderbook_keys() {
+        let market_id = "550e8400-e29b-41d4-a716-446655440000";
+        let outcome_id = "660e8400-e29b-41d4-a716-446655440001";
+        assert_eq!(
+            CacheKey::pm_orderbook(market_id, outcome_id, "YES"),
+            "orderbook:pm:550e8400-e29b-41d4-a716-446655440000:660e8400-e29b-41d4-a716-446655440001:yes"
+        );
+        assert_eq!(
+            CacheKey::pm_orderbook_snapshot(market_id, outcome_id, "no"),
+            "orderbook:pm:550e8400-e29b-41d4-a716-446655440000:660e8400-e29b-41d4-a716-446655440001:no:snapshot"
+        );
+    }
+
+    #[test]
+    fn test_share_keys() {
+        let addr = "0x1234ABCD";
+        let market_id = "550e8400-e29b-41d4-a716-446655440000";
+        let outcome_id = "660e8400-e29b-41d4-a716-446655440001";
+
+        assert_eq!(CacheKey::user_shares(addr, None), "share:0x1234abcd");
+        assert_eq!(
+            CacheKey::user_shares(addr, Some(market_id)),
+            "share:0x1234abcd:550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(
+            CacheKey::share_holding(addr, market_id, outcome_id, "YES"),
+            "share:0x1234abcd:550e8400-e29b-41d4-a716-446655440000:660e8400-e29b-41d4-a716-446655440001:yes"
+        );
+    }
+
+    #[test]
+    fn test_pm_channel_keys() {
+        let market_id = "550e8400-e29b-41d4-a716-446655440000";
+        let outcome_id = "660e8400-e29b-41d4-a716-446655440001";
+        let addr = "0x1234ABCD";
+
+        assert_eq!(
+            CacheKey::channel_pm_trades(market_id),
+            "channel:pm:trades:550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(
+            CacheKey::channel_pm_orderbook(market_id, outcome_id, "yes"),
+            "channel:pm:orderbook:550e8400-e29b-41d4-a716-446655440000:660e8400-e29b-41d4-a716-446655440001:yes"
+        );
+        assert_eq!(
+            CacheKey::channel_pm_probability(market_id),
+            "channel:pm:prob:550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(
+            CacheKey::channel_pm_user_shares(addr),
+            "channel:pm:shares:0x1234abcd"
+        );
+    }
+
+    #[test]
+    fn test_pm_ttl_values() {
+        assert_eq!(ttl::MARKET, 60);
+        assert_eq!(ttl::MARKET_LIST, 30);
+        assert_eq!(ttl::PROBABILITY, 5);
+        assert_eq!(ttl::SHARES, 10);
+        assert_eq!(ttl::MARKET_ORDERBOOK, 2);
     }
 }

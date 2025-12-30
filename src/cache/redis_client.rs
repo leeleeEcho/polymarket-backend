@@ -237,6 +237,21 @@ impl RedisClient {
         }).await
     }
 
+    /// INCRBYFLOAT operation (for Decimal increments)
+    pub async fn incr_float(&self, key: &str, amount: String) -> Result<String, RedisError> {
+        self.with_retry(|mut conn| {
+            let key = key.to_string();
+            let amount = amount.clone();
+            async move {
+                redis::cmd("INCRBYFLOAT")
+                    .arg(&key)
+                    .arg(&amount)
+                    .query_async(&mut conn)
+                    .await
+            }
+        }).await
+    }
+
     // ==================== Hash Operations ====================
 
     /// HGET operation

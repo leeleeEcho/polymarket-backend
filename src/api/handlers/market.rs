@@ -536,6 +536,37 @@ pub async fn get_market(
     State(state): State<Arc<AppState>>,
     Path(market_id): Path<Uuid>,
 ) -> Result<Json<MarketInfo>, (StatusCode, Json<ErrorResponse>)> {
+    use crate::cache::{CachedMarket, CachedOutcome};
+
+    // Try cache first
+    if let Some(market_cache) = state.cache.market_opt() {
+        if let Ok(Some(cached)) = market_cache.get_market(market_id).await {
+            tracing::debug!("Cache hit for market {}", market_id);
+            return Ok(Json(MarketInfo {
+                id: cached.id,
+                question: cached.question,
+                description: cached.description,
+                category: cached.category.unwrap_or_default(),
+                outcomes: cached
+                    .outcomes
+                    .into_iter()
+                    .map(|o| OutcomeInfo {
+                        id: o.id,
+                        name: o.name,
+                        probability: o.probability,
+                    })
+                    .collect(),
+                status: cached.status,
+                resolution_source: cached.resolution_source,
+                end_time: cached.end_time,
+                volume_24h: cached.volume_24h,
+                total_volume: cached.total_volume,
+                liquidity: Decimal::ZERO,
+                created_at: cached.created_at,
+            }));
+        }
+    }
+
     // Query market from database
     let market_data: Option<(
         Uuid,
@@ -596,15 +627,43 @@ pub async fn get_market(
     .unwrap_or_default();
 
     let outcomes: Vec<OutcomeInfo> = outcomes_data
-        .into_iter()
+        .iter()
         .map(|(oid, name, probability)| OutcomeInfo {
-            id: oid,
-            name,
-            probability,
+            id: *oid,
+            name: name.clone(),
+            probability: *probability,
         })
         .collect();
 
     let liquidity = Decimal::ZERO; // TODO: Calculate from orderbook
+
+    // Cache the result
+    if let Some(market_cache) = state.cache.market_opt() {
+        let cached_market = CachedMarket {
+            id,
+            question: question.clone(),
+            description: description.clone(),
+            category: Some(category.clone()),
+            status: status.clone(),
+            resolution_source: resolution_source.clone(),
+            end_time: end_time.map(|t| t.timestamp_millis()),
+            outcomes: outcomes_data
+                .into_iter()
+                .map(|(oid, name, probability)| CachedOutcome {
+                    id: oid,
+                    name,
+                    probability,
+                })
+                .collect(),
+            volume_24h,
+            total_volume,
+            created_at: created_at.timestamp_millis(),
+            updated_at: chrono::Utc::now().timestamp_millis(),
+        };
+        if let Err(e) = market_cache.set_market(&cached_market).await {
+            tracing::warn!("Failed to cache market {}: {}", market_id, e);
+        }
+    }
 
     Ok(Json(MarketInfo {
         id,

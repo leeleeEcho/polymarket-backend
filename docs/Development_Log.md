@@ -310,6 +310,7 @@ SettlementType::Cancellation // Market was cancelled
 | Phase 7 | 65 |
 | Phase 8 | 65 |
 | Phase 9 | 67 |
+| Phase 10 | 76 |
 
 All tests passing.
 
@@ -445,11 +446,143 @@ POST /admin/markets/:market_id/refresh-probability
 
 ---
 
+## Phase 10: Performance Optimization - Market Cache (Completed)
+
+**Date:** 2024-12-30
+
+### Overview
+实现预测市场专用缓存层，优化市场数据、概率、用户持仓和订单簿的访问性能。
+
+### 新增缓存键前缀
+```rust
+// src/cache/keys.rs
+pub const MARKET: &str = "market";      // 市场数据
+pub const OUTCOME: &str = "outcome";    // 结果数据
+pub const SHARE: &str = "share";        // 用户持仓
+pub const PROBABILITY: &str = "prob";   // 概率数据
+```
+
+### 新增 TTL 配置
+| 数据类型 | TTL | 说明 |
+|----------|-----|------|
+| MARKET | 60s | 市场详情 |
+| MARKET_LIST | 30s | 市场列表 |
+| PROBABILITY | 5s | 概率数据 |
+| SHARES | 10s | 用户持仓 |
+| MARKET_ORDERBOOK | 2s | 订单簿快照 |
+
+### 新增文件
+- `src/cache/market_cache.rs` - MarketCache 服务
+
+### 缓存数据结构
+```rust
+/// 缓存的市场数据
+pub struct CachedMarket {
+    pub id: Uuid,
+    pub question: String,
+    pub description: Option<String>,
+    pub category: Option<String>,
+    pub status: String,
+    pub outcomes: Vec<CachedOutcome>,
+    pub volume_24h: Decimal,
+    pub total_volume: Decimal,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// 缓存的用户持仓
+pub struct CachedShareHolding {
+    pub market_id: Uuid,
+    pub outcome_id: Uuid,
+    pub share_type: String,
+    pub amount: Decimal,
+    pub avg_cost: Decimal,
+    pub current_price: Decimal,
+    pub unrealized_pnl: Decimal,
+}
+
+/// 缓存的订单簿快照
+pub struct CachedPMOrderbook {
+    pub market_id: Uuid,
+    pub outcome_id: Uuid,
+    pub share_type: String,
+    pub bids: Vec<[String; 2]>,
+    pub asks: Vec<[String; 2]>,
+    pub timestamp: i64,
+}
+```
+
+### MarketCache 方法
+```rust
+// 市场数据
+get_market(market_id) -> Option<CachedMarket>
+set_market(&CachedMarket)
+invalidate_market(market_id)
+
+// 市场列表
+get_market_list(category) -> Option<Vec<CachedMarket>>
+set_market_list(&[CachedMarket], category)
+invalidate_market_list(category)
+
+// 概率数据
+get_probability(market_id, outcome_id) -> Option<Decimal>
+set_probability(market_id, outcome_id, probability)
+get_market_probabilities(market_id) -> Option<Vec<(Uuid, Decimal)>>
+
+// 用户持仓
+get_user_shares(address, market_id) -> Option<Vec<CachedShareHolding>>
+set_user_shares(address, market_id, &[CachedShareHolding])
+invalidate_user_shares(address, market_id)
+
+// 订单簿
+get_orderbook(market_id, outcome_id, share_type) -> Option<CachedPMOrderbook>
+set_orderbook(&CachedPMOrderbook)
+
+// 成交量
+incr_volume(market_id, amount)
+get_volume(market_id) -> Option<Decimal>
+```
+
+### API Handler 集成示例
+```rust
+// GET /markets/:market_id
+pub async fn get_market(state, market_id) {
+    // 1. 先查缓存
+    if let Some(cache) = state.cache.market_opt() {
+        if let Ok(Some(cached)) = cache.get_market(market_id).await {
+            return Ok(Json(cached.into()));  // 缓存命中
+        }
+    }
+
+    // 2. 查数据库
+    let market = db.get_market(market_id).await?;
+
+    // 3. 写入缓存
+    if let Some(cache) = state.cache.market_opt() {
+        cache.set_market(&market.into()).await.ok();
+    }
+
+    Ok(Json(market))
+}
+```
+
+### Pub/Sub 频道
+| 频道 | 格式 | 说明 |
+|------|------|------|
+| channel:pm:trades:{market_id} | 市场交易 | 交易推送 |
+| channel:pm:orderbook:{market_id}:{outcome_id}:{share_type} | 订单簿 | 订单簿更新 |
+| channel:pm:prob:{market_id} | 概率 | 概率更新推送 |
+| channel:pm:shares:{address} | 用户持仓 | 持仓变动推送 |
+
+### Tests
+- 76 tests passing (新增 9 个缓存测试)
+
+---
+
 ## Next Steps (TODO)
 
-1. **Performance Optimization** - Add caching for frequently accessed data
-2. **Monitoring** - Add metrics and alerting
-3. **External Oracle Integration** - Implement Chainlink/UMA/Pyth integrations
+1. **Monitoring** - Add metrics and alerting
+2. **External Oracle Integration** - Implement Chainlink/UMA/Pyth integrations
 
 ---
 

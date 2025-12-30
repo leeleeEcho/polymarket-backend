@@ -54,18 +54,17 @@
 //! ```
 
 pub mod keys;
+pub mod market_cache;
 pub mod orderbook_cache;
 pub mod price_cache;
 pub mod pubsub;
 pub mod redis_client;
 pub mod user_cache;
 
-// TODO: Implement share_cache for prediction markets
-// pub mod share_cache;
-
 use std::sync::Arc;
 
 // Re-exports for convenience (only export what's commonly used externally)
+pub use market_cache::{CachedMarket, CachedOutcome, CachedPMOrderbook, CachedShareHolding, MarketCache};
 pub use orderbook_cache::OrderbookCache;
 pub use price_cache::PriceCache;
 pub use pubsub::PubSubManager;
@@ -131,6 +130,7 @@ pub struct CacheManager {
     price_cache: Option<PriceCache>,
     orderbook_cache: Option<OrderbookCache>,
     user_cache: Option<UserCache>,
+    market_cache: Option<MarketCache>,
     pubsub_manager: Option<PubSubManager>,
 }
 
@@ -145,6 +145,7 @@ impl CacheManager {
                 price_cache: None,
                 orderbook_cache: None,
                 user_cache: None,
+                market_cache: None,
                 pubsub_manager: None,
             });
         }
@@ -166,6 +167,7 @@ impl CacheManager {
                 let orderbook_cache =
                     OrderbookCache::with_depth(Arc::clone(&redis), config.orderbook_depth);
                 let user_cache = UserCache::new(Arc::clone(&redis));
+                let market_cache = MarketCache::new(Arc::clone(&redis));
                 let pubsub_manager = PubSubManager::new(Arc::clone(&redis), &config.redis_url);
 
                 tracing::info!("Cache manager initialized with Redis at {}", config.redis_url);
@@ -176,6 +178,7 @@ impl CacheManager {
                     price_cache: Some(price_cache),
                     orderbook_cache: Some(orderbook_cache),
                     user_cache: Some(user_cache),
+                    market_cache: Some(market_cache),
                     pubsub_manager: Some(pubsub_manager),
                 })
             }
@@ -189,6 +192,7 @@ impl CacheManager {
                     price_cache: None,
                     orderbook_cache: None,
                     user_cache: None,
+                    market_cache: None,
                     pubsub_manager: None,
                 })
             }
@@ -257,6 +261,18 @@ impl CacheManager {
     /// Get user cache if available
     pub fn user_opt(&self) -> Option<&UserCache> {
         self.user_cache.as_ref()
+    }
+
+    /// Get market cache (prediction markets)
+    pub fn market(&self) -> &MarketCache {
+        self.market_cache.as_ref().unwrap_or_else(|| {
+            panic!("Market cache not available - Redis is not connected")
+        })
+    }
+
+    /// Get market cache if available
+    pub fn market_opt(&self) -> Option<&MarketCache> {
+        self.market_cache.as_ref()
     }
 
     /// Get pub/sub manager
