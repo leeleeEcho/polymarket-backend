@@ -1013,6 +1013,207 @@ pub async fn resolve_market(
     }))
 }
 
+/// Update probability request
+#[derive(Debug, Deserialize)]
+pub struct UpdateProbabilityRequest {
+    /// Outcome ID to update (must be a Yes outcome)
+    pub outcome_id: Uuid,
+    /// New probability (0.01 - 0.99)
+    pub probability: Decimal,
+}
+
+/// Update probability response
+#[derive(Debug, Serialize)]
+pub struct UpdateProbabilityResponse {
+    pub market_id: Uuid,
+    pub outcome_id: Uuid,
+    pub yes_probability: Decimal,
+    pub no_probability: Decimal,
+    pub message: String,
+}
+
+/// Refresh probability request
+#[derive(Debug, Deserialize)]
+pub struct RefreshProbabilityRequest {
+    /// Source: "orderbook" or oracle name like "chainlink", "uma"
+    pub source: Option<String>,
+}
+
+/// Update market probability manually - Admin only
+/// POST /admin/markets/:market_id/probability
+pub async fn update_probability(
+    State(state): State<Arc<AppState>>,
+    Path(market_id): Path<Uuid>,
+    Json(req): Json<UpdateProbabilityRequest>,
+) -> Result<Json<UpdateProbabilityResponse>, (StatusCode, Json<ErrorResponse>)> {
+    use crate::services::oracle::{OracleError, PriceOracle};
+
+    // Validate probability range
+    if req.probability < Decimal::new(1, 2) || req.probability > Decimal::new(99, 2) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Probability must be between 0.01 and 0.99".to_string(),
+                code: "INVALID_PROBABILITY".to_string(),
+            }),
+        ));
+    }
+
+    // Create oracle service
+    let oracle = PriceOracle::new(state.db.pool.clone(), state.matching_engine.clone());
+
+    // Update probability
+    oracle
+        .set_probability_manual(market_id, req.outcome_id, req.probability)
+        .await
+        .map_err(|e| {
+            let (status, code, message) = match &e {
+                OracleError::MarketNotFound(_) => (
+                    StatusCode::NOT_FOUND,
+                    "MARKET_NOT_FOUND",
+                    "市场不存在",
+                ),
+                OracleError::OutcomeNotFound(_) => (
+                    StatusCode::NOT_FOUND,
+                    "OUTCOME_NOT_FOUND",
+                    "结果不存在",
+                ),
+                OracleError::MarketNotActive(_) => (
+                    StatusCode::BAD_REQUEST,
+                    "MARKET_NOT_ACTIVE",
+                    "市场不是活跃状态",
+                ),
+                OracleError::InvalidProbability(_) => (
+                    StatusCode::BAD_REQUEST,
+                    "INVALID_PROBABILITY",
+                    "无效的概率值",
+                ),
+                OracleError::DatabaseError(e) => {
+                    tracing::error!("Database error updating probability: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "DATABASE_ERROR",
+                        "数据库错误",
+                    )
+                }
+                OracleError::ExternalOracleError(e) => {
+                    tracing::error!("Oracle error: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "ORACLE_ERROR",
+                        "预言机错误",
+                    )
+                }
+            };
+            (
+                status,
+                Json(ErrorResponse {
+                    error: message.to_string(),
+                    code: code.to_string(),
+                }),
+            )
+        })?;
+
+    let no_probability = Decimal::ONE - req.probability;
+
+    tracing::info!(
+        "Updated probability for market {}: yes={}, no={}",
+        market_id, req.probability, no_probability
+    );
+
+    Ok(Json(UpdateProbabilityResponse {
+        market_id,
+        outcome_id: req.outcome_id,
+        yes_probability: req.probability,
+        no_probability,
+        message: format!("Probability updated to {}", req.probability),
+    }))
+}
+
+/// Refresh probability from orderbook - Admin only
+/// POST /admin/markets/:market_id/refresh-probability
+pub async fn refresh_probability(
+    State(state): State<Arc<AppState>>,
+    Path(market_id): Path<Uuid>,
+    Json(req): Json<RefreshProbabilityRequest>,
+) -> Result<Json<UpdateProbabilityResponse>, (StatusCode, Json<ErrorResponse>)> {
+    use crate::services::oracle::PriceOracle;
+
+    let source = req.source.unwrap_or_else(|| "orderbook".to_string());
+
+    // Get Yes outcome for this market
+    let outcome: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM outcomes WHERE market_id = $1 AND share_type = 'yes'"
+    )
+    .bind(market_id)
+    .fetch_optional(&state.db.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to fetch outcome: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Database error".to_string(),
+                code: "DB_ERROR".to_string(),
+            }),
+        )
+    })?;
+
+    let (outcome_id,) = outcome.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Market or outcome not found".to_string(),
+                code: "NOT_FOUND".to_string(),
+            }),
+        )
+    })?;
+
+    // Create oracle service
+    let oracle = PriceOracle::new(state.db.pool.clone(), state.matching_engine.clone());
+
+    // Refresh probability based on source
+    let probability = if source == "orderbook" {
+        oracle
+            .update_from_orderbook(market_id, outcome_id)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to refresh from orderbook: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to refresh: {}", e),
+                        code: "REFRESH_FAILED".to_string(),
+                    }),
+                )
+            })?
+    } else {
+        // Try external oracle
+        oracle
+            .fetch_from_external(market_id, &source)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("{}", e),
+                        code: "ORACLE_ERROR".to_string(),
+                    }),
+                )
+            })?
+    };
+
+    let no_probability = Decimal::ONE - probability;
+
+    Ok(Json(UpdateProbabilityResponse {
+        market_id,
+        outcome_id,
+        yes_probability: probability,
+        no_probability,
+        message: format!("Probability refreshed from {} to {}", source, probability),
+    }))
+}
+
 /// Cancel a market - Admin only
 /// POST /admin/markets/:market_id/cancel
 pub async fn cancel_market(

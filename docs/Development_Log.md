@@ -309,6 +309,7 @@ SettlementType::Cancellation // Market was cancelled
 | Phase 6 | 64 |
 | Phase 7 | 65 |
 | Phase 8 | 65 |
+| Phase 9 | 67 |
 
 All tests passing.
 
@@ -364,11 +365,91 @@ pub enum UserRole {
 
 ---
 
+## Phase 9: Price Oracle (Completed)
+
+**Date:** 2024-12-30
+
+### Overview
+实现价格预言机服务，支持多种来源更新市场概率：
+- **Orderbook**: 从订单簿计算加权中间价
+- **External**: 外部预言机（Chainlink, UMA, Pyth）- 预留接口
+- **Manual**: 管理员手动设置
+- **Trade**: 交易执行后自动更新
+
+### 新增文件
+- `src/services/oracle.rs` - Price Oracle 服务
+
+### 新增 API 端点
+
+| Method | Endpoint | 描述 |
+|--------|----------|------|
+| POST | `/admin/markets/:market_id/probability` | 手动设置概率 |
+| POST | `/admin/markets/:market_id/refresh-probability` | 从数据源刷新概率 |
+
+### 核心功能
+
+```rust
+// PriceOracle 服务
+PriceOracle::new(pool, matching_engine)
+PriceOracle::update_from_orderbook(market_id, outcome_id)  // 从订单簿更新
+PriceOracle::update_from_trade(market_id, outcome_id, price)  // 从交易更新
+PriceOracle::set_probability_manual(market_id, outcome_id, prob)  // 手动设置
+PriceOracle::fetch_from_external(market_id, oracle_name)  // 外部预言机
+PriceOracle::refresh_all_from_orderbook()  // 批量刷新所有市场
+```
+
+### 概率计算逻辑
+
+**从订单簿计算:**
+```
+weighted_mid = (best_bid × ask_volume + best_ask × bid_volume) / (bid_volume + ask_volume)
+```
+
+**概率范围:** 0.01 - 0.99 (自动裁剪)
+
+### 请求/响应格式
+
+**手动更新概率:**
+```json
+POST /admin/markets/:market_id/probability
+{
+    "outcome_id": "uuid",
+    "probability": 0.65
+}
+
+Response:
+{
+    "market_id": "uuid",
+    "outcome_id": "uuid",
+    "yes_probability": 0.65,
+    "no_probability": 0.35,
+    "message": "Probability updated to 0.65"
+}
+```
+
+**刷新概率:**
+```json
+POST /admin/markets/:market_id/refresh-probability
+{
+    "source": "orderbook"  // 或 "chainlink", "uma", "pyth"
+}
+```
+
+### 支持的外部预言机 (TODO)
+- Chainlink
+- UMA
+- Pyth
+
+### Tests
+- 67 tests passing (新增 2 个 oracle 测试)
+
+---
+
 ## Next Steps (TODO)
 
-1. **Price Oracle Integration** - Update probabilities from external sources
-2. **Performance Optimization** - Add caching for frequently accessed data
-3. **Monitoring** - Add metrics and alerting
+1. **Performance Optimization** - Add caching for frequently accessed data
+2. **Monitoring** - Add metrics and alerting
+3. **External Oracle Integration** - Implement Chainlink/UMA/Pyth integrations
 
 ---
 

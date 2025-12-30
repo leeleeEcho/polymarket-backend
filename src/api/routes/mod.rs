@@ -55,6 +55,8 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/admin/markets/:market_id/close", post(handlers::market::close_market))
         .route("/admin/markets/:market_id/resolve", post(handlers::market::resolve_market))
         .route("/admin/markets/:market_id/cancel", post(handlers::market::cancel_market))
+        .route("/admin/markets/:market_id/probability", post(handlers::market::update_probability))
+        .route("/admin/markets/:market_id/refresh-probability", post(handlers::market::refresh_probability))
         // Admin middleware must come BEFORE auth middleware in the layer chain
         // (layers are applied in reverse order, so auth runs first, then admin)
         .layer(axum_middleware::from_fn(admin_middleware))
