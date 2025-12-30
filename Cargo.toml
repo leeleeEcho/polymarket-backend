@@ -52,6 +52,10 @@ dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
+# Metrics & Monitoring
+metrics = "0.22"
+metrics-exporter-prometheus = "0.13"
+
 # Config
 config = "0.14"
 

@@ -20,6 +20,7 @@ mod auth;
 mod cache;
 mod config;
 mod db;
+mod metrics;
 mod models;
 mod services;
 mod utils;
@@ -30,6 +31,7 @@ use crate::config::AppConfig;
 use crate::db::Database;
 use crate::services::matching::MatchingEngine;
 use crate::services::market::MarketService;
+use metrics_exporter_prometheus::PrometheusHandle;
 
 pub struct AppState {
     pub config: AppConfig,
@@ -38,6 +40,7 @@ pub struct AppState {
     pub matching_engine: Arc<MatchingEngine>,
     pub market_service: Arc<MarketService>,
     pub order_update_sender: broadcast::Sender<OrderUpdateEvent>,
+    pub metrics_handle: PrometheusHandle,
 }
 
 #[tokio::main]
@@ -57,6 +60,10 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting Polymarket Backend v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!("Environment: {}", config.environment);
+
+    // Initialize Prometheus metrics
+    let metrics_handle = metrics::init_metrics();
+    tracing::info!("Prometheus metrics initialized");
 
     // Initialize EIP-712 domain from config
     crate::auth::eip712::init_domain(config.chain_id, &config.vault_address);
@@ -109,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
         matching_engine,
         market_service,
         order_update_sender,
+        metrics_handle,
     });
 
     // Start trade persistence worker
@@ -144,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
     // Build router
     let app = Router::new()
         .route("/health", get(health_check))
+        .route("/metrics", get(metrics_endpoint))
         .nest("/api/v1", api::routes::create_router(state.clone()))
         .nest("/ws", websocket::routes::create_router(state.clone()))
         .layer(
@@ -167,4 +176,11 @@ async fn main() -> anyhow::Result<()> {
 
 async fn health_check() -> &'static str {
     "OK"
+}
+
+/// Prometheus metrics endpoint
+async fn metrics_endpoint(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+) -> String {
+    state.metrics_handle.render()
 }
