@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::auth::middleware::AuthUser;
 use crate::models::market::ShareType;
 use crate::models::{BalanceResponse, UserProfile};
+use crate::services::settlement::{SettlementService, SettlementError};
 use crate::AppState;
 
 // ============================================================================
@@ -620,4 +621,172 @@ pub async fn get_shares(
         total_cost,
         total_unrealized_pnl,
     }))
+}
+
+// ============================================================================
+// Settlement Types
+// ============================================================================
+
+/// Settlement result response
+#[derive(Debug, Serialize)]
+pub struct SettlementResponse {
+    pub market_id: Uuid,
+    pub settlement_type: String,
+    pub shares_settled: Vec<ShareSettlementDetail>,
+    pub total_payout: Decimal,
+    pub message: String,
+}
+
+/// Individual share settlement detail
+#[derive(Debug, Serialize)]
+pub struct ShareSettlementDetail {
+    pub outcome_id: Uuid,
+    pub share_type: ShareType,
+    pub amount: Decimal,
+    pub payout_per_share: Decimal,
+    pub total_payout: Decimal,
+}
+
+/// Settlement status response
+#[derive(Debug, Serialize)]
+pub struct SettlementStatusResponse {
+    pub market_id: Uuid,
+    pub market_status: String,
+    pub is_settled: bool,
+    pub can_settle: bool,
+    pub potential_payout: Decimal,
+    pub share_count: usize,
+}
+
+// ============================================================================
+// Settlement Handlers
+// ============================================================================
+
+/// Settle user's shares for a resolved or cancelled market
+/// POST /account/settle/:market_id
+pub async fn settle_market(
+    State(state): State<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    axum::extract::Path(market_id): axum::extract::Path<Uuid>,
+) -> Result<Json<SettlementResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user_address = auth_user.address.to_lowercase();
+
+    let result = SettlementService::settle_user_shares(&state.db.pool, market_id, &user_address)
+        .await
+        .map_err(|e| {
+            let (status, code, message) = match &e {
+                SettlementError::MarketNotFound(_) => (
+                    StatusCode::NOT_FOUND,
+                    "MARKET_NOT_FOUND",
+                    "市场不存在",
+                ),
+                SettlementError::MarketNotSettleable(_) => (
+                    StatusCode::BAD_REQUEST,
+                    "MARKET_NOT_SETTLEABLE",
+                    "市场尚未结算或取消",
+                ),
+                SettlementError::NoWinningOutcome(_) => (
+                    StatusCode::BAD_REQUEST,
+                    "NO_WINNING_OUTCOME",
+                    "市场未设置获胜结果",
+                ),
+                SettlementError::NoSharesToSettle(_) => (
+                    StatusCode::BAD_REQUEST,
+                    "NO_SHARES",
+                    "没有可结算的份额",
+                ),
+                SettlementError::AlreadySettled(_) => (
+                    StatusCode::BAD_REQUEST,
+                    "ALREADY_SETTLED",
+                    "已经结算过",
+                ),
+                SettlementError::DatabaseError(e) => {
+                    tracing::error!("Settlement database error: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "DATABASE_ERROR",
+                        "数据库错误",
+                    )
+                }
+            };
+
+            (
+                status,
+                Json(ErrorResponse {
+                    error: message.to_string(),
+                    code: code.to_string(),
+                }),
+            )
+        })?;
+
+    let settlement_type_str = match result.settlement_type {
+        crate::services::settlement::SettlementType::Resolution => "resolution",
+        crate::services::settlement::SettlementType::Cancellation => "cancellation",
+    };
+
+    let shares_settled: Vec<ShareSettlementDetail> = result
+        .shares_settled
+        .into_iter()
+        .map(|s| ShareSettlementDetail {
+            outcome_id: s.outcome_id,
+            share_type: s.share_type,
+            amount: s.amount,
+            payout_per_share: s.payout_per_share,
+            total_payout: s.total_payout,
+        })
+        .collect();
+
+    let message = format!(
+        "成功结算 {} USDC",
+        result.total_payout
+    );
+
+    Ok(Json(SettlementResponse {
+        market_id: result.market_id,
+        settlement_type: settlement_type_str.to_string(),
+        shares_settled,
+        total_payout: result.total_payout,
+        message,
+    }))
+}
+
+/// Get settlement status for a market
+/// GET /account/settle/:market_id/status
+pub async fn get_settlement_status(
+    State(state): State<Arc<AppState>>,
+    Extension(auth_user): Extension<AuthUser>,
+    axum::extract::Path(market_id): axum::extract::Path<Uuid>,
+) -> Result<Json<SettlementStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user_address = auth_user.address.to_lowercase();
+
+    let status = SettlementService::get_settlement_status(&state.db.pool, market_id, &user_address)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to get settlement status: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "获取结算状态失败".to_string(),
+                    code: "SETTLEMENT_STATUS_FAILED".to_string(),
+                }),
+            )
+        })?;
+
+    match status {
+        Some(s) => Ok(Json(SettlementStatusResponse {
+            market_id: s.market_id,
+            market_status: s.market_status,
+            is_settled: s.is_settled,
+            can_settle: s.can_settle,
+            potential_payout: s.potential_payout,
+            share_count: s.share_count,
+        })),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "没有找到相关持仓".to_string(),
+                code: "NO_SHARES_FOUND".to_string(),
+            }),
+        )),
+    }
 }

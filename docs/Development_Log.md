@@ -226,13 +226,88 @@ ShareUpdate {
 
 ---
 
+## Phase 7: Settlement Logic (Completed)
+
+**Date:** 2024-12-30
+
+### Overview
+Implemented settlement logic for resolved and cancelled markets:
+- **Resolved Markets**: Winning share holders receive 1 USDC per share
+- **Cancelled Markets**: All share holders receive refunds at cost basis
+
+### New Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/account/settle/:market_id` | Settle user's shares for a resolved/cancelled market |
+| GET | `/account/settle/:market_id/status` | Get settlement status and potential payout |
+
+### Settlement Service (`src/services/settlement.rs`)
+
+```rust
+// Core functions
+SettlementService::settle_user_shares(pool, market_id, user_address)
+SettlementService::get_settlement_status(pool, market_id, user_address)
+
+// Settlement types
+SettlementType::Resolution  // Market resolved with winning outcome
+SettlementType::Cancellation // Market was cancelled
+```
+
+### Settlement Logic
+
+#### Resolved Markets
+- YES shares for winning outcome: 1.0 USDC per share
+- NO shares for losing outcome: 1.0 USDC per share (inverse win)
+- Losing shares: 0 USDC (worthless)
+
+#### Cancelled Markets
+- All shares refunded at `avg_cost` price
+- `payout = amount × avg_cost`
+
+### Database Changes
+- Uses `share_changes` table with `change_type = 'redeem'` for audit trail
+- Credits USDC to user's `balances` table
+
+### Response Format
+```json
+{
+  "market_id": "uuid",
+  "settlement_type": "resolution",
+  "shares_settled": [
+    {
+      "outcome_id": "uuid",
+      "share_type": "yes",
+      "amount": "100.0",
+      "payout_per_share": "1.0",
+      "total_payout": "100.0"
+    }
+  ],
+  "total_payout": "100.0",
+  "message": "成功结算 100.0 USDC"
+}
+```
+
+### Error Handling
+- `MARKET_NOT_FOUND` - Market doesn't exist
+- `MARKET_NOT_SETTLEABLE` - Market not resolved or cancelled
+- `NO_WINNING_OUTCOME` - Resolved market missing winning outcome
+- `NO_SHARES` - User has no shares in market
+- `ALREADY_SETTLED` - Shares already settled
+
+### Tests
+- 65 tests passing (added `test_settlement_type_equality`)
+
+---
+
 ## Test Summary
 
 | Phase | Tests |
 |-------|-------|
 | Phase 1 | 61 |
 | Phase 2 | 64 |
-| Final | 64 |
+| Phase 6 | 64 |
+| Phase 7 | 65 |
 
 All tests passing.
 
@@ -241,10 +316,9 @@ All tests passing.
 ## Next Steps (TODO)
 
 1. **Admin Middleware** - Add proper admin role checking
-2. **Settlement Logic** - Implement share redemption after market resolution
-3. **Price Oracle Integration** - Update probabilities from external sources
-4. **Performance Optimization** - Add caching for frequently accessed data
-5. **Monitoring** - Add metrics and alerting
+2. **Price Oracle Integration** - Update probabilities from external sources
+3. **Performance Optimization** - Add caching for frequently accessed data
+4. **Monitoring** - Add metrics and alerting
 
 ---
 

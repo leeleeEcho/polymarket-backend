@@ -31,6 +31,9 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/account/shares", get(handlers::account::get_shares))
         .route("/account/orders", get(handlers::account::get_orders))
         .route("/account/trades", get(handlers::account::get_trades))
+        // Settlement
+        .route("/account/settle/:market_id", post(handlers::account::settle_market))
+        .route("/account/settle/:market_id/status", get(handlers::account::get_settlement_status))
         // Orders
         .route("/orders", post(handlers::order::create_order))
         .route("/orders/:order_id", get(handlers::order::get_order))
