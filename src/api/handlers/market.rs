@@ -473,3 +473,611 @@ pub async fn get_price(
     // Same as ticker for now
     get_ticker(State(state), Path(market_id)).await
 }
+
+// ============================================================================
+// Admin Handlers for Market Management
+// ============================================================================
+
+/// Create market request
+#[derive(Debug, Deserialize)]
+pub struct CreateMarketRequest {
+    /// Gnosis Conditional Tokens conditionId
+    pub condition_id: String,
+    /// Market question
+    pub question: String,
+    /// Market description
+    pub description: Option<String>,
+    /// Market category
+    pub category: Option<String>,
+    /// Resolution source (UMA, Chainlink, Manual)
+    pub resolution_source: Option<String>,
+    /// End time (timestamp in milliseconds)
+    pub end_time: Option<i64>,
+    /// Yes outcome token ID
+    pub yes_token_id: String,
+    /// No outcome token ID
+    pub no_token_id: String,
+}
+
+/// Create market response
+#[derive(Debug, Serialize)]
+pub struct CreateMarketResponse {
+    pub market_id: Uuid,
+    pub yes_outcome_id: Uuid,
+    pub no_outcome_id: Uuid,
+    pub message: String,
+}
+
+/// Close market request (stops trading)
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+pub struct CloseMarketRequest {
+    pub reason: Option<String>,
+}
+
+/// Resolve market request
+#[derive(Debug, Deserialize)]
+pub struct ResolveMarketRequest {
+    /// Which outcome won: "yes" or "no"
+    pub winning_outcome: String,
+}
+
+/// Market status response
+#[derive(Debug, Serialize)]
+pub struct MarketStatusResponse {
+    pub market_id: Uuid,
+    pub status: String,
+    pub message: String,
+}
+
+/// Get single market details
+/// GET /markets/:market_id
+pub async fn get_market(
+    State(state): State<Arc<AppState>>,
+    Path(market_id): Path<Uuid>,
+) -> Result<Json<MarketInfo>, (StatusCode, Json<ErrorResponse>)> {
+    // Query market from database
+    let market_data: Option<(
+        Uuid,
+        String,
+        Option<String>,
+        String,
+        String,
+        Option<String>,
+        Option<DateTime<Utc>>,
+        Decimal,
+        Decimal,
+        DateTime<Utc>,
+    )> = sqlx::query_as(
+        r#"
+        SELECT id, question, description, category, status::text,
+               resolution_source, end_time, volume_24h, total_volume, created_at
+        FROM markets
+        WHERE id = $1
+        "#,
+    )
+    .bind(market_id)
+    .fetch_optional(&state.db.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to fetch market: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Failed to fetch market".to_string(),
+                code: "MARKET_FETCH_FAILED".to_string(),
+            }),
+        )
+    })?;
+
+    let (id, question, description, category, status, resolution_source, end_time, volume_24h, total_volume, created_at) =
+        market_data.ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: "Market not found".to_string(),
+                    code: "MARKET_NOT_FOUND".to_string(),
+                }),
+            )
+        })?;
+
+    // Get outcomes for the market
+    let outcomes_data: Vec<(Uuid, String, Decimal)> = sqlx::query_as(
+        r#"
+        SELECT id, name, probability
+        FROM outcomes
+        WHERE market_id = $1
+        ORDER BY name
+        "#,
+    )
+    .bind(id)
+    .fetch_all(&state.db.pool)
+    .await
+    .unwrap_or_default();
+
+    let outcomes: Vec<OutcomeInfo> = outcomes_data
+        .into_iter()
+        .map(|(oid, name, probability)| OutcomeInfo {
+            id: oid,
+            name,
+            probability,
+        })
+        .collect();
+
+    let liquidity = Decimal::ZERO; // TODO: Calculate from orderbook
+
+    Ok(Json(MarketInfo {
+        id,
+        question,
+        description,
+        category,
+        outcomes,
+        status,
+        resolution_source,
+        end_time: end_time.map(|t| t.timestamp_millis()),
+        volume_24h,
+        total_volume,
+        liquidity,
+        created_at: created_at.timestamp_millis(),
+    }))
+}
+
+/// Create a new prediction market (Admin only)
+/// POST /admin/markets
+pub async fn create_market(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateMarketRequest>,
+) -> Result<Json<CreateMarketResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Validate condition_id format (should be 66 chars hex string with 0x prefix)
+    if !req.condition_id.starts_with("0x") || req.condition_id.len() != 66 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Invalid condition_id format. Must be 0x + 64 hex chars".to_string(),
+                code: "INVALID_CONDITION_ID".to_string(),
+            }),
+        ));
+    }
+
+    // Check if market with this condition_id already exists
+    let existing: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM markets WHERE condition_id = $1",
+    )
+    .bind(&req.condition_id)
+    .fetch_optional(&state.db.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to check existing market: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Database error".to_string(),
+                code: "DB_ERROR".to_string(),
+            }),
+        )
+    })?;
+
+    if existing.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "Market with this condition_id already exists".to_string(),
+                code: "MARKET_EXISTS".to_string(),
+            }),
+        ));
+    }
+
+    let market_id = Uuid::new_v4();
+    let yes_outcome_id = Uuid::new_v4();
+    let no_outcome_id = Uuid::new_v4();
+    let category = req.category.unwrap_or_else(|| "general".to_string());
+    let resolution_source = req.resolution_source.unwrap_or_else(|| "UMA".to_string());
+    let end_time = req.end_time.map(|ts| {
+        chrono::DateTime::from_timestamp_millis(ts)
+            .unwrap_or_else(chrono::Utc::now)
+    });
+
+    // Start transaction
+    let mut tx = state.db.pool.begin().await.map_err(|e| {
+        tracing::error!("Failed to start transaction: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Database error".to_string(),
+                code: "DB_ERROR".to_string(),
+            }),
+        )
+    })?;
+
+    // Create market
+    sqlx::query(
+        r#"
+        INSERT INTO markets (id, condition_id, question, description, category, resolution_source, end_time)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        "#,
+    )
+    .bind(market_id)
+    .bind(&req.condition_id)
+    .bind(&req.question)
+    .bind(&req.description)
+    .bind(&category)
+    .bind(&resolution_source)
+    .bind(end_time)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to create market: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Failed to create market".to_string(),
+                code: "MARKET_CREATE_FAILED".to_string(),
+            }),
+        )
+    })?;
+
+    // Create Yes outcome
+    sqlx::query(
+        r#"
+        INSERT INTO outcomes (id, market_id, token_id, name, share_type, complement_id, probability)
+        VALUES ($1, $2, $3, 'Yes', 'yes', $4, 0.5)
+        "#,
+    )
+    .bind(yes_outcome_id)
+    .bind(market_id)
+    .bind(&req.yes_token_id)
+    .bind(no_outcome_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to create Yes outcome: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Failed to create outcomes".to_string(),
+                code: "OUTCOME_CREATE_FAILED".to_string(),
+            }),
+        )
+    })?;
+
+    // Create No outcome
+    sqlx::query(
+        r#"
+        INSERT INTO outcomes (id, market_id, token_id, name, share_type, complement_id, probability)
+        VALUES ($1, $2, $3, 'No', 'no', $4, 0.5)
+        "#,
+    )
+    .bind(no_outcome_id)
+    .bind(market_id)
+    .bind(&req.no_token_id)
+    .bind(yes_outcome_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to create No outcome: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Failed to create outcomes".to_string(),
+                code: "OUTCOME_CREATE_FAILED".to_string(),
+            }),
+        )
+    })?;
+
+    // Commit transaction
+    tx.commit().await.map_err(|e| {
+        tracing::error!("Failed to commit transaction: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Failed to create market".to_string(),
+                code: "TX_COMMIT_FAILED".to_string(),
+            }),
+        )
+    })?;
+
+    tracing::info!(
+        "Created market {} with question: {}",
+        market_id,
+        req.question
+    );
+
+    Ok(Json(CreateMarketResponse {
+        market_id,
+        yes_outcome_id,
+        no_outcome_id,
+        message: "Market created successfully".to_string(),
+    }))
+}
+
+/// Close a market (pause trading) - Admin only
+/// POST /admin/markets/:market_id/close
+pub async fn close_market(
+    State(state): State<Arc<AppState>>,
+    Path(market_id): Path<Uuid>,
+    Json(_req): Json<CloseMarketRequest>,
+) -> Result<Json<MarketStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Check market exists and is active
+    let market_status: Option<(String,)> = sqlx::query_as(
+        "SELECT status::text FROM markets WHERE id = $1",
+    )
+    .bind(market_id)
+    .fetch_optional(&state.db.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to fetch market: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Database error".to_string(),
+                code: "DB_ERROR".to_string(),
+            }),
+        )
+    })?;
+
+    let (current_status,) = market_status.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Market not found".to_string(),
+                code: "MARKET_NOT_FOUND".to_string(),
+            }),
+        )
+    })?;
+
+    if current_status != "active" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Cannot close market with status: {}", current_status),
+                code: "INVALID_STATUS".to_string(),
+            }),
+        ));
+    }
+
+    // Update market status to paused
+    sqlx::query("UPDATE markets SET status = 'paused' WHERE id = $1")
+        .bind(market_id)
+        .execute(&state.db.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to close market: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Failed to close market".to_string(),
+                    code: "MARKET_CLOSE_FAILED".to_string(),
+                }),
+            )
+        })?;
+
+    tracing::info!("Closed market {}", market_id);
+
+    Ok(Json(MarketStatusResponse {
+        market_id,
+        status: "paused".to_string(),
+        message: "Market has been closed. Trading is now paused.".to_string(),
+    }))
+}
+
+/// Resolve a market (set winning outcome) - Admin only
+/// POST /admin/markets/:market_id/resolve
+pub async fn resolve_market(
+    State(state): State<Arc<AppState>>,
+    Path(market_id): Path<Uuid>,
+    Json(req): Json<ResolveMarketRequest>,
+) -> Result<Json<MarketStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Validate winning_outcome
+    let winning_share_type = match req.winning_outcome.to_lowercase().as_str() {
+        "yes" => "yes",
+        "no" => "no",
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: "winning_outcome must be 'yes' or 'no'".to_string(),
+                    code: "INVALID_OUTCOME".to_string(),
+                }),
+            ));
+        }
+    };
+
+    // Check market exists and is active or paused
+    let market_status: Option<(String,)> = sqlx::query_as(
+        "SELECT status::text FROM markets WHERE id = $1",
+    )
+    .bind(market_id)
+    .fetch_optional(&state.db.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to fetch market: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Database error".to_string(),
+                code: "DB_ERROR".to_string(),
+            }),
+        )
+    })?;
+
+    let (current_status,) = market_status.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Market not found".to_string(),
+                code: "MARKET_NOT_FOUND".to_string(),
+            }),
+        )
+    })?;
+
+    if current_status == "resolved" || current_status == "cancelled" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Cannot resolve market with status: {}", current_status),
+                code: "INVALID_STATUS".to_string(),
+            }),
+        ));
+    }
+
+    // Get winning outcome ID
+    let winning_outcome: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM outcomes WHERE market_id = $1 AND share_type = $2::share_type",
+    )
+    .bind(market_id)
+    .bind(winning_share_type)
+    .fetch_optional(&state.db.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to fetch outcome: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Database error".to_string(),
+                code: "DB_ERROR".to_string(),
+            }),
+        )
+    })?;
+
+    let (winning_outcome_id,) = winning_outcome.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Winning outcome not found".to_string(),
+                code: "OUTCOME_NOT_FOUND".to_string(),
+            }),
+        )
+    })?;
+
+    // Update market status and winning outcome
+    sqlx::query(
+        r#"
+        UPDATE markets
+        SET status = 'resolved',
+            winning_outcome_id = $1,
+            resolved_at = NOW()
+        WHERE id = $2
+        "#,
+    )
+    .bind(winning_outcome_id)
+    .bind(market_id)
+    .execute(&state.db.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to resolve market: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Failed to resolve market".to_string(),
+                code: "MARKET_RESOLVE_FAILED".to_string(),
+            }),
+        )
+    })?;
+
+    // Update probabilities: winning = 1.0, losing = 0.0
+    sqlx::query(
+        r#"
+        UPDATE outcomes
+        SET probability = CASE
+            WHEN id = $1 THEN 1.0
+            ELSE 0.0
+        END
+        WHERE market_id = $2
+        "#,
+    )
+    .bind(winning_outcome_id)
+    .bind(market_id)
+    .execute(&state.db.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to update outcome probabilities: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Failed to update probabilities".to_string(),
+                code: "PROBABILITY_UPDATE_FAILED".to_string(),
+            }),
+        )
+    })?;
+
+    tracing::info!(
+        "Resolved market {} with winning outcome: {}",
+        market_id,
+        winning_share_type
+    );
+
+    Ok(Json(MarketStatusResponse {
+        market_id,
+        status: "resolved".to_string(),
+        message: format!("Market resolved. Winning outcome: {}", winning_share_type),
+    }))
+}
+
+/// Cancel a market - Admin only
+/// POST /admin/markets/:market_id/cancel
+pub async fn cancel_market(
+    State(state): State<Arc<AppState>>,
+    Path(market_id): Path<Uuid>,
+) -> Result<Json<MarketStatusResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Check market exists and is not already cancelled/resolved
+    let market_status: Option<(String,)> = sqlx::query_as(
+        "SELECT status::text FROM markets WHERE id = $1",
+    )
+    .bind(market_id)
+    .fetch_optional(&state.db.pool)
+    .await
+    .map_err(|e| {
+        tracing::error!("Failed to fetch market: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "Database error".to_string(),
+                code: "DB_ERROR".to_string(),
+            }),
+        )
+    })?;
+
+    let (current_status,) = market_status.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: "Market not found".to_string(),
+                code: "MARKET_NOT_FOUND".to_string(),
+            }),
+        )
+    })?;
+
+    if current_status == "resolved" || current_status == "cancelled" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Cannot cancel market with status: {}", current_status),
+                code: "INVALID_STATUS".to_string(),
+            }),
+        ));
+    }
+
+    // Update market status to cancelled
+    sqlx::query("UPDATE markets SET status = 'cancelled' WHERE id = $1")
+        .bind(market_id)
+        .execute(&state.db.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to cancel market: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Failed to cancel market".to_string(),
+                    code: "MARKET_CANCEL_FAILED".to_string(),
+                }),
+            )
+        })?;
+
+    tracing::info!("Cancelled market {}", market_id);
+
+    Ok(Json(MarketStatusResponse {
+        market_id,
+        status: "cancelled".to_string(),
+        message: "Market has been cancelled. All positions will be refunded.".to_string(),
+    }))
+}

@@ -17,10 +17,11 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/auth/nonce/:address", get(handlers::auth::get_nonce))
         // Markets (prediction market specific)
         .route("/markets", get(handlers::market::list_markets))
-        .route("/markets/:symbol/orderbook", get(handlers::market::get_orderbook))
-        .route("/markets/:symbol/trades", get(handlers::market::get_trades))
-        .route("/markets/:symbol/ticker", get(handlers::market::get_ticker))
-        .route("/markets/:symbol/price", get(handlers::market::get_price));
+        .route("/markets/:market_id", get(handlers::market::get_market))
+        .route("/markets/:market_id/orderbook", get(handlers::market::get_orderbook))
+        .route("/markets/:market_id/trades", get(handlers::market::get_trades))
+        .route("/markets/:market_id/ticker", get(handlers::market::get_ticker))
+        .route("/markets/:market_id/price", get(handlers::market::get_price));
 
     // Protected routes (auth required)
     let protected_routes = Router::new()
@@ -45,7 +46,17 @@ pub fn create_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/withdraw/:id/confirm", post(handlers::withdraw::confirm_withdraw))
         .layer(axum_middleware::from_fn_with_state(state.clone(), auth_middleware));
 
+    // Admin routes (auth required + admin check)
+    // TODO: Add proper admin middleware that checks for admin role
+    let admin_routes = Router::new()
+        .route("/admin/markets", post(handlers::market::create_market))
+        .route("/admin/markets/:market_id/close", post(handlers::market::close_market))
+        .route("/admin/markets/:market_id/resolve", post(handlers::market::resolve_market))
+        .route("/admin/markets/:market_id/cancel", post(handlers::market::cancel_market))
+        .layer(axum_middleware::from_fn_with_state(state.clone(), auth_middleware));
+
     Router::new()
         .merge(public_routes)
         .merge(protected_routes)
+        .merge(admin_routes)
 }
