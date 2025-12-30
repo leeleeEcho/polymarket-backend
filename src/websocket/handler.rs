@@ -191,6 +191,49 @@ pub enum ServerMessage {
         channel: String,
         data: KlineData,
     },
+    // =========================================
+    // Prediction Market Specific Messages
+    // =========================================
+    /// Trade event for prediction markets
+    MarketTrade {
+        id: String,
+        market_id: String,
+        outcome_id: String,
+        share_type: String,
+        match_type: String, // "normal", "mint", "merge"
+        price: String,
+        amount: String,
+        side: String,
+        timestamp: i64,
+    },
+    /// Orderbook update for prediction markets
+    MarketOrderbook {
+        market_id: String,
+        outcome_id: String,
+        share_type: String,
+        bids: Vec<OrderbookLevel>,
+        asks: Vec<OrderbookLevel>,
+        timestamp: i64,
+    },
+    /// Market status/probability update
+    MarketUpdate {
+        market_id: String,
+        status: String,
+        yes_price: String,
+        no_price: String,
+        volume_24h: String,
+        timestamp: i64,
+    },
+    /// User share position update
+    ShareUpdate {
+        market_id: String,
+        outcome_id: String,
+        share_type: String,
+        amount: String,
+        avg_cost: String,
+        unrealized_pnl: String,
+        event: String, // "buy", "sell", "mint", "merge"
+    },
 }
 
 /// Orderbook level for WebSocket (frontend compatible format)
@@ -287,25 +330,46 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 }
             }
 
-            // Handle trade events from matching engine
+            // Handle trade events from matching engine (prediction market trades)
             trade = trade_receiver.recv() => {
                 match trade {
                     Ok(trade_event) => {
-                        tracing::debug!(
-                            "📊 WebSocket received trade event: symbol={}, price={}, amount={}, side={}",
-                            trade_event.symbol, trade_event.price, trade_event.amount, trade_event.side
-                        );
-                        
-                        let trade_channel = format!("trades:{}", trade_event.symbol);
-                        tracing::debug!(
-                            "📡 Checking subscriptions for channel '{}': {:?}",
-                            trade_channel, subscriptions
-                        );
-                        
-                        if subscriptions.contains(&trade_channel) || subscriptions.contains("trades:*") {
-                            tracing::info!("✅ Sending trade to WebSocket client: {}", trade_channel);
-                            // Generate unique trade ID from timestamp and random suffix
-                            let trade_id = format!("{}-{}", trade_event.timestamp, Uuid::new_v4().to_string().split('-').next().unwrap_or("0"));
+                        // Generate unique trade ID
+                        let trade_id = format!("{}-{}", trade_event.timestamp, Uuid::new_v4().to_string().split('-').next().unwrap_or("0"));
+
+                        // Check for prediction market channel subscriptions
+                        // Channels: "trades:{market_id}", "market:{market_id}", "trades:*"
+                        let market_id = trade_event.market_id.to_string();
+                        let market_trade_channel = format!("trades:{}", market_id);
+                        let market_channel = format!("market:{}", market_id);
+
+                        let subscribed_to_market = subscriptions.contains(&market_trade_channel)
+                            || subscriptions.contains(&market_channel)
+                            || subscriptions.contains("trades:*");
+
+                        if subscribed_to_market {
+                            tracing::info!(
+                                "✅ Sending market trade: market_id={}, match_type={}",
+                                market_id, trade_event.match_type
+                            );
+
+                            let msg = ServerMessage::MarketTrade {
+                                id: trade_id.clone(),
+                                market_id: market_id.clone(),
+                                outcome_id: trade_event.outcome_id.to_string(),
+                                share_type: trade_event.share_type.to_string(),
+                                match_type: trade_event.match_type.to_string().to_lowercase(),
+                                price: trade_event.price.to_string(),
+                                amount: trade_event.amount.to_string(),
+                                side: trade_event.side.clone(),
+                                timestamp: trade_event.timestamp,
+                            };
+                            let _ = sender.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                        }
+
+                        // Also check legacy symbol-based channel (backwards compatibility)
+                        let symbol_channel = format!("trades:{}", trade_event.symbol);
+                        if subscriptions.contains(&symbol_channel) {
                             let msg = ServerMessage::Trade {
                                 id: trade_id,
                                 symbol: trade_event.symbol.clone(),
@@ -315,11 +379,6 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                 timestamp: trade_event.timestamp,
                             };
                             let _ = sender.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
-                        } else {
-                            tracing::warn!(
-                                "⚠️  Trade NOT sent - no matching subscription. Channel: '{}', Have: {:?}",
-                                trade_channel, subscriptions
-                            );
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -336,19 +395,55 @@ pub async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             orderbook = orderbook_receiver.recv() => {
                 match orderbook {
                     Ok(orderbook_update) => {
-                        let orderbook_channel = format!("orderbook:{}", orderbook_update.symbol);
-                        if subscriptions.contains(&orderbook_channel) || subscriptions.contains("orderbook:*") {
-                            // Convert to frontend-compatible format
-                            let bids: Vec<OrderbookLevel> = orderbook_update.bids
-                                .into_iter()
-                                .map(|[price, size]| OrderbookLevel { price, size })
-                                .collect();
-                            let asks: Vec<OrderbookLevel> = orderbook_update.asks
-                                .into_iter()
-                                .map(|[price, size]| OrderbookLevel { price, size })
-                                .collect();
+                        // Convert to frontend-compatible format
+                        let bids: Vec<OrderbookLevel> = orderbook_update.bids
+                            .iter()
+                            .map(|[price, size]| OrderbookLevel { price: price.clone(), size: size.clone() })
+                            .collect();
+                        let asks: Vec<OrderbookLevel> = orderbook_update.asks
+                            .iter()
+                            .map(|[price, size]| OrderbookLevel { price: price.clone(), size: size.clone() })
+                            .collect();
+
+                        // Symbol format for prediction markets: {market_id}:{outcome_id}:{share_type}
+                        let symbol = &orderbook_update.symbol;
+
+                        // Check for prediction market orderbook channel
+                        // Channels: "orderbook:{market_id}:{outcome_id}:{share_type}", "orderbook:{market_id}", "market:{market_id}"
+                        let parts: Vec<&str> = symbol.split(':').collect();
+                        if parts.len() == 3 {
+                            // Prediction market orderbook
+                            let market_id = parts[0];
+                            let outcome_id = parts[1];
+                            let share_type = parts[2];
+
+                            let specific_channel = format!("orderbook:{}", symbol);
+                            let market_ob_channel = format!("orderbook:{}", market_id);
+                            let market_channel = format!("market:{}", market_id);
+
+                            let subscribed = subscriptions.contains(&specific_channel)
+                                || subscriptions.contains(&market_ob_channel)
+                                || subscriptions.contains(&market_channel)
+                                || subscriptions.contains("orderbook:*");
+
+                            if subscribed {
+                                let msg = ServerMessage::MarketOrderbook {
+                                    market_id: market_id.to_string(),
+                                    outcome_id: outcome_id.to_string(),
+                                    share_type: share_type.to_string(),
+                                    bids: bids.clone(),
+                                    asks: asks.clone(),
+                                    timestamp: orderbook_update.timestamp,
+                                };
+                                let _ = sender.send(Message::Text(serde_json::to_string(&msg).unwrap())).await;
+                            }
+                        }
+
+                        // Also check legacy symbol-based channel (backwards compatibility)
+                        let orderbook_channel = format!("orderbook:{}", symbol);
+                        if subscriptions.contains(&orderbook_channel) {
                             let msg = ServerMessage::Orderbook {
-                                symbol: orderbook_update.symbol.clone(),
+                                symbol: symbol.clone(),
                                 bids,
                                 asks,
                                 timestamp: orderbook_update.timestamp,
